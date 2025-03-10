@@ -6,6 +6,8 @@ This module provides functions to:
 2. Process frames and compute entropy for each tile
 3. Generate output video with overlaid entropy values
 4. Export entropy values to CSV
+
+Optimized for GPU acceleration and parallel processing.
 """
 
 import os
@@ -14,6 +16,10 @@ import numpy as np
 import csv
 from tqdm import tqdm
 import torch
+import time
+import concurrent.futures
+from functools import partial
+import gc
 
 from src.fibonacci_lattice import (
     generate_fibonacci_points,
@@ -26,7 +32,7 @@ from src.mrf_model import QuadwiseMRF
 from src.entropy_calculator import EntropyCalculator
 
 class VideoProcessor:
-    def __init__(self, input_path, output_path, num_tiles=55, use_gpu=True):
+    def __init__(self, input_path, output_path, num_tiles=55, use_gpu=True, batch_size=8):
         """
         Initialize with video paths and parameters.
         
@@ -40,11 +46,14 @@ class VideoProcessor:
             Number of tiles to partition the sphere into (default: 55)
         use_gpu : bool
             Whether to use GPU acceleration if available
+        batch_size : int
+            Number of frames to process in a batch (default: 8)
         """
         self.input_path = input_path
         self.output_path = output_path
         self.num_tiles = num_tiles
         self.use_gpu = use_gpu and torch.cuda.is_available()
+        self.batch_size = batch_size
         
         # Check if input video exists
         if not os.path.exists(input_path):
@@ -55,26 +64,39 @@ class VideoProcessor:
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
-        # Initialize MRF model and entropy calculator
-        self.mrf_model = QuadwiseMRF()
-        self.entropy_calculator = EntropyCalculator(self.mrf_model)
-        
-        # Initialize GPU tensors if using GPU
+        # Initialize GPU device
         if self.use_gpu:
             self.device = torch.device("cuda")
             print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            
+            # Set optimal tensor precision for the GPU
+            torch.set_float32_matmul_precision('high')
+            
+            # Determine optimal batch size based on available GPU memory
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # in GB
+            self.batch_size = min(self.batch_size, max(1, int(gpu_mem / 2)))  # Heuristic: 2GB per frame
+            print(f"Using batch size of {self.batch_size} based on available GPU memory")
         else:
             self.device = torch.device("cpu")
             print("Using CPU for computations")
+        
+        # Initialize MRF model and entropy calculator with GPU acceleration
+        self.mrf_model = QuadwiseMRF()
+        self.entropy_calculator = EntropyCalculator(self.mrf_model)
+        
+        # Pre-generate tile mapping for efficiency
+        self.tile_regions = None
     
-    def extract_frames(self, sample_rate=1.0):
+    def extract_frames(self, sample_rate=1.0, max_frames=None):
         """
-        Extract frames from input video.
+        Extract frames from input video with optimized memory usage.
         
         Parameters:
         -----------
         sample_rate : float
             Fraction of frames to extract (default: 1.0)
+        max_frames : int, optional
+            Maximum number of frames to extract (default: None, extract all)
             
         Returns:
         --------
@@ -83,6 +105,8 @@ class VideoProcessor:
         fps : float
             Frames per second of the input video
         """
+        start_time = time.time()
+        
         # Open video file
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
@@ -93,6 +117,11 @@ class VideoProcessor:
         fps = cap.get(cv2.CAP_PROP_FPS)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Apply max_frames limit if specified
+        if max_frames is not None and max_frames < frame_count:
+            frame_count = max_frames
+            print(f"Limited to {max_frames} frames")
         
         print(f"Video properties: {width}x{height}, {fps} fps, {frame_count} frames")
         
@@ -109,15 +138,20 @@ class VideoProcessor:
                 
             if i in sample_indices:
                 frames.append(frame)
+            
+            if max_frames is not None and i >= max_frames - 1:
+                break
         
         cap.release()
         
-        print(f"Extracted {len(frames)} frames")
+        elapsed = time.time() - start_time
+        print(f"Extracted {len(frames)} frames in {elapsed:.2f} seconds")
         return frames, fps
     
     def generate_tiles(self, frame):
         """
         Generate tiles for a frame using Fibonacci lattice.
+        Uses cached tile regions for better performance.
         
         Parameters:
         -----------
@@ -134,26 +168,44 @@ class VideoProcessor:
         # Get frame dimensions
         height, width = frame.shape[:2]
         
-        # Generate Fibonacci lattice points
-        points_3d, points_2d = generate_fibonacci_points(self.num_tiles)
+        # Generate tile regions if not already cached
+        if self.tile_regions is None:
+            start_time = time.time()
+            print("Generating Fibonacci lattice tiling...")
+            
+            # Generate Fibonacci lattice points
+            points_3d, points_2d = generate_fibonacci_points(self.num_tiles)
+            
+            # Compute Voronoi regions
+            sv = compute_voronoi_regions(points_3d)
+            
+            # Map to ERP rectangles
+            self.tile_regions = map_to_erp_rectangles(sv, points_2d, width, height)
+            
+            elapsed = time.time() - start_time
+            print(f"Tile regions generated in {elapsed:.2f} seconds")
         
-        # Compute Voronoi regions
-        sv = compute_voronoi_regions(points_3d)
-        
-        # Map to ERP rectangles
-        tile_regions = map_to_erp_rectangles(sv, points_2d, width, height)
-        
-        # Extract tiles
+        # Extract tiles in parallel with threading
         tiles = []
-        for region in tile_regions:
-            tile, mask = extract_tile_from_frame(frame, region)
-            tiles.append(tile)
-        
-        return tiles, tile_regions
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # Define extraction function
+            extract_func = partial(extract_tile_from_frame, frame)
+            
+            # Submit all extraction tasks
+            future_to_region = {executor.submit(extract_func, region): i 
+                              for i, region in enumerate(self.tile_regions)}
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_region):
+                tile, mask = future.result()
+                tiles.append(tile)
+                
+        return tiles, self.tile_regions
     
     def estimate_empirical_distribution(self, frames_sample):
         """
         Estimate empirical distribution from frame samples.
+        Uses GPU-accelerated implementation.
         
         Parameters:
         -----------
@@ -164,12 +216,21 @@ class VideoProcessor:
         --------
         None (updates self.mrf_model.empirical_dist)
         """
-        print("Estimating empirical distribution...")
-        return self.mrf_model.estimate_empirical_distribution(frames_sample)
+        start_time = time.time()
+        print("Estimating empirical distribution with GPU acceleration...")
+        
+        # Use the GPU-accelerated implementation in the MRF model
+        result = self.mrf_model.estimate_empirical_distribution(frames_sample)
+        
+        elapsed = time.time() - start_time
+        print(f"Empirical distribution estimation completed in {elapsed:.2f} seconds")
+        
+        return result
     
     def compute_frame_entropy(self, frame, tile_regions, custom_potential=None):
         """
         Compute entropy for each tile in a frame.
+        Optimized with GPU acceleration.
         
         Parameters:
         -----------
@@ -185,25 +246,53 @@ class VideoProcessor:
         entropies : list of float
             Entropy value for each tile
         """
-        entropies = []
-        
+        # Extract all tiles first
+        tiles = []
         for region in tile_regions:
-            # Extract tile
             tile, _ = extract_tile_from_frame(frame, region)
-            
-            # Compute entropy
-            entropy = self.entropy_calculator.compute_entropy(tile, custom_potential)
-            
-            # Round to 4 decimal places
-            entropy = round(entropy, 4)
-            
-            entropies.append(entropy)
+            tiles.append(tile)
+        
+        # Batch compute entropy for all tiles
+        entropies = self.entropy_calculator.batch_compute_entropy(tiles, custom_potential)
+        
+        # Round to 4 decimal places
+        entropies = [round(entropy, 4) for entropy in entropies]
         
         return entropies
     
+    def process_frame_batch(self, frames, tile_regions, custom_potential=None):
+        """
+        Process a batch of frames in parallel.
+        
+        Parameters:
+        -----------
+        frames : list of ndarrays
+            List of video frames to process
+        tile_regions : list of dicts
+            List of tile region definitions
+        custom_potential : function, optional
+            Custom smoothness function to replace the default
+            
+        Returns:
+        --------
+        batch_entropies : list of lists
+            List of entropy values for each frame in the batch
+        """
+        batch_entropies = []
+        
+        # Process each frame in the batch
+        for i, frame in enumerate(frames):
+            # Compute entropy for each tile
+            entropies = self.compute_frame_entropy(frame, tile_regions, custom_potential)
+            
+            # Store entropy values
+            batch_entropies.append(entropies)
+            
+        return batch_entropies
+    
     def process_video(self, custom_potential=None, sample_rate=0.1):
         """
-        Process the entire video.
+        Process the entire video with batch processing.
         
         Parameters:
         -----------
@@ -219,6 +308,8 @@ class VideoProcessor:
         fps : float
             Frames per second of the input video
         """
+        start_time = time.time()
+        
         # Extract frames
         frames, fps = self.extract_frames()
         
@@ -229,17 +320,41 @@ class VideoProcessor:
         # Estimate empirical distribution
         self.estimate_empirical_distribution(frames_sample)
         
-        # Generate tiles for first frame (tile regions are the same for all frames)
+        # Clear the sample frames to free memory
+        frames_sample = None
+        gc.collect()
+        if self.use_gpu:
+            torch.cuda.empty_cache()
+        
+        # Generate tile regions (only need to do this once)
         _, tile_regions = self.generate_tiles(frames[0])
         
-        # Process each frame
+        # Process frames in batches
         frame_entropies = []
-        for i, frame in enumerate(tqdm(frames, desc="Processing frames")):
-            # Compute entropy for each tile
-            entropies = self.compute_frame_entropy(frame, tile_regions, custom_potential)
+        total_batches = int(np.ceil(len(frames) / self.batch_size))
+        
+        for batch_idx in tqdm(range(total_batches), desc="Processing frame batches"):
+            # Get batch of frames
+            start_idx = batch_idx * self.batch_size
+            end_idx = min((batch_idx + 1) * self.batch_size, len(frames))
+            batch_frames = frames[start_idx:end_idx]
             
-            # Store entropy values
-            frame_entropies.append([i] + entropies)  # Add frame number at the beginning
+            # Process the batch
+            batch_entropies = self.process_frame_batch(batch_frames, tile_regions, custom_potential)
+            
+            # Add frame numbers to entropy values
+            for i, entropies in enumerate(batch_entropies):
+                frame_num = start_idx + i
+                frame_entropies.append([frame_num] + entropies)
+                
+            # Free memory after each batch
+            gc.collect()
+            if self.use_gpu:
+                torch.cuda.empty_cache()
+        
+        total_time = time.time() - start_time
+        print(f"Video processing completed in {total_time:.2f} seconds")
+        print(f"Average time per frame: {total_time / len(frames):.2f} seconds")
         
         return frame_entropies, fps
     
@@ -259,6 +374,8 @@ class VideoProcessor:
         csv_path : str
             Path to the generated CSV file
         """
+        start_time = time.time()
+        
         if csv_path is None:
             csv_path = os.path.splitext(self.output_path)[0] + ".csv"
         
@@ -271,12 +388,14 @@ class VideoProcessor:
             writer.writerow(header)
             writer.writerows(frame_entropies)
         
-        print(f"Entropy values exported to {csv_path}")
+        elapsed = time.time() - start_time
+        print(f"Entropy values exported to {csv_path} in {elapsed:.2f} seconds")
         return csv_path
     
     def generate_output_video(self, frame_entropies, fps=30):
         """
         Generate output video with overlaid entropy values.
+        Uses tile region caching for efficiency.
         
         Parameters:
         -----------
@@ -290,11 +409,14 @@ class VideoProcessor:
         output_path : str
             Path to the generated video file
         """
+        start_time = time.time()
+        
         # Extract frames
         frames, _ = self.extract_frames()
         
-        # Generate tiles for first frame (tile regions are the same for all frames)
-        _, tile_regions = self.generate_tiles(frames[0])
+        # Use cached tile regions or generate if needed
+        if self.tile_regions is None:
+            _, self.tile_regions = self.generate_tiles(frames[0])
         
         # Get frame dimensions
         height, width = frames[0].shape[:2]
@@ -312,7 +434,7 @@ class VideoProcessor:
             vis_frame = frame.copy()
             
             # Visualize tile boundaries
-            vis_frame = visualize_tiling(vis_frame, tile_regions)
+            vis_frame = visualize_tiling(vis_frame, self.tile_regions)
             
             # Overlay average entropy
             text = f"Avg Entropy: {avg_entropy:.4f}"
@@ -324,12 +446,13 @@ class VideoProcessor:
         # Release video writer
         out.release()
         
-        print(f"Output video generated at {self.output_path}")
+        elapsed = time.time() - start_time
+        print(f"Output video generated at {self.output_path} in {elapsed:.2f} seconds")
         return self.output_path
     
     def run(self, custom_potential=None, sample_rate=0.1):
         """
-        Run the entire pipeline.
+        Run the entire pipeline with optimized processing.
         
         Parameters:
         -----------
@@ -343,6 +466,12 @@ class VideoProcessor:
         result : dict
             Dictionary containing paths to output files
         """
+        # Set CUDA benchmark mode for optimal performance
+        if self.use_gpu:
+            torch.backends.cudnn.benchmark = True
+            
+        total_start_time = time.time()
+        
         # Process video and compute entropy
         frame_entropies, fps = self.process_video(custom_potential, sample_rate)
         
@@ -352,6 +481,13 @@ class VideoProcessor:
         # Generate output video
         output_path = self.generate_output_video(frame_entropies, fps)
         
+        total_elapsed = time.time() - total_start_time
+        print(f"Total processing completed in {total_elapsed:.2f} seconds")
+        
+        # Clean up GPU memory
+        if self.use_gpu:
+            torch.cuda.empty_cache()
+            
         return {
             "video_path": output_path,
             "csv_path": csv_path

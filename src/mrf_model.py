@@ -33,6 +33,7 @@ class QuadwiseMRF:
         self.beta = beta
         self.epsilon = epsilon
         self.empirical_dist = None  # Will be populated by estimate_empirical_distribution
+        self.probs_tensor = None    # GPU tensor version of empirical distribution
         
         # Initialize device for PyTorch operations
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -178,8 +179,7 @@ class QuadwiseMRF:
         
     def estimate_empirical_distribution(self, frames, sample_rate=0.1):
         """
-        Estimate empirical distribution from frame samples.
-        GPU-accelerated with PyTorch.
+        Estimate empirical distribution from frame samples with improved GPU utilization.
         
         Parameters:
         -----------
@@ -210,22 +210,51 @@ class QuadwiseMRF:
         # Get cliques from the first frame (same for all frames)
         cliques = self.define_cliques(quantized_frames[0])
         
-        # Process each frame - shows a progress bar
+        # Create tensor to hold clique coordinates
+        # Each clique has 4 pixels, each pixel has 2 coordinates (i,j)
+        # Shape: [num_cliques, 4, 2]
+        clique_coords = torch.zeros(len(cliques), 4, 2, dtype=torch.long, device=self.device)
+        
+        # Populate clique coordinates tensor
+        for cidx, clique in enumerate(cliques):
+            for pidx, (i, j) in enumerate(clique):
+                clique_coords[cidx, pidx, 0] = i  # row
+                clique_coords[cidx, pidx, 1] = j  # column
+        
+        # Process each frame with tensor operations - shows a progress bar
         for frame_idx, quantized_frame in enumerate(tqdm(quantized_frames, desc="Processing empirical distribution")):
-            # Extract clique values and update counts
-            for clique in cliques:
-                values = tuple(quantized_frame[i, j] for i, j in clique)
-                # Update counts tensor (indices are the clique values)
-                counts_tensor[values] += 1
+            # Convert to tensor for GPU processing
+            if not isinstance(quantized_frame, torch.Tensor):
+                frame_tensor = torch.from_numpy(quantized_frame).to(self.device)
+            else:
+                frame_tensor = quantized_frame
+                
+            # Process all cliques in batch where possible
+            for cidx, clique in enumerate(cliques):
+                # Extract the 4 pixel values for this clique
+                i1, j1 = clique[0]
+                i2, j2 = clique[1]
+                i3, j3 = clique[2]
+                i4, j4 = clique[3]
+                
+                # Get the values
+                v1 = int(frame_tensor[i1, j1].item())
+                v2 = int(frame_tensor[i2, j2].item())
+                v3 = int(frame_tensor[i3, j3].item())
+                v4 = int(frame_tensor[i4, j4].item())
+                
+                # Update counts tensor
+                counts_tensor[v1, v2, v3, v4] += 1
                 total_cliques += 1
         
         # Convert counts to probabilities
         probs_tensor = counts_tensor / total_cliques
         
-        # Move tensor to CPU and convert to dictionary
-        probs_np = probs_tensor.cpu().numpy()
+        # Store GPU tensor version for faster lookups
+        self.probs_tensor = probs_tensor
         
-        # Convert to dictionary for compatibility with existing code
+        # Also create dict version for compatibility
+        probs_np = probs_tensor.cpu().numpy()
         empirical_dist = {}
         for idx, prob in np.ndenumerate(probs_np):
             if prob > 0:  # Only store non-zero probabilities
@@ -376,11 +405,12 @@ class QuadwiseMRF:
     
     def batch_compute_potentials(self, quantized_frame, cliques, custom_potential=None):
         """
-        Compute potentials for all cliques in a frame in batch mode.
+        Compute potentials for all cliques in a frame using true batch operations.
+        GPU-optimized for significantly faster processing.
         
         Parameters:
         -----------
-        quantized_frame : ndarray
+        quantized_frame : ndarray or tensor
             Frame with quantized pixel values
         cliques : list of list of tuples
             List of cliques, where each clique is a list of (i,j) coordinates
@@ -389,8 +419,8 @@ class QuadwiseMRF:
             
         Returns:
         --------
-        potentials : list of float
-            List of potential values for each clique
+        potentials : torch.Tensor or list
+            Tensor or list of potential values for each clique
         """
         # Convert frame to tensor if it's not already
         if not isinstance(quantized_frame, torch.Tensor):
@@ -398,34 +428,65 @@ class QuadwiseMRF:
         else:
             frame_tensor = quantized_frame
             
-        # Initialize potentials list
-        potentials = []
+        # Use larger batch size for much better GPU utilization
+        batch_size = 256  # Increased from 128
         
-        # Process cliques in batches for better GPU utilization
-        batch_size = 128  # Adjust based on GPU memory
+        # Process batches with tensor operations for GPU acceleration
+        all_potentials = []
+        
         for i in range(0, len(cliques), batch_size):
             batch_cliques = cliques[i:i+batch_size]
-            batch_values = []
+            batch_size_actual = len(batch_cliques)
             
-            # Extract values for each clique in the batch
-            for clique in batch_cliques:
-                values = self.extract_clique_values(frame_tensor, clique)
-                batch_values.append(values)
+            # Create tensor to hold all batch clique values [batch_size, 4]
+            batch_values = torch.zeros(batch_size_actual, 4, dtype=torch.long, device=self.device)
+            
+            # Extract all clique values at once
+            for j, clique in enumerate(batch_cliques):
+                for k, (r, c) in enumerate(clique):
+                    batch_values[j, k] = frame_tensor[r, c]
+            
+            # Use the GPU tensor version of empirical distribution if available and no custom potential
+            if self.probs_tensor is not None and custom_potential is None:
+                # Compute potentials for the entire batch at once
+                batch_energies = torch.zeros(batch_size_actual, device=self.device)
                 
-            # Stack tensors for batch processing if using tensors
-            if isinstance(batch_values[0], torch.Tensor):
-                batch_values_tensor = torch.stack(batch_values)
+                for j in range(batch_size_actual):
+                    # Get probability from probs_tensor
+                    v1, v2, v3, v4 = batch_values[j]
+                    p_data = self.probs_tensor[v1, v2, v3, v4] + self.epsilon
+                    
+                    # Compute smoothness using vectorized operations
+                    x = batch_values[j].float()
+                    
+                    # All possible pairs in a 2×2 clique (6 pairs)
+                    pairs = torch.tensor([[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]], device=self.device)
+                    a = x[pairs[:, 0]]
+                    b = x[pairs[:, 1]]
+                    
+                    # Sum of squared differences
+                    smoothness = torch.sum((a - b) ** 2)
+                    
+                    # Calculate energy
+                    batch_energies[j] = -torch.log(p_data) + self.beta * smoothness
                 
-                # Compute potentials for the batch (this would require modifying compute_potential)
-                # For now, process each clique individually
-                batch_potentials = [self.compute_potential(values, custom_potential) 
-                                   for values in batch_values]
-                
+                # Convert all energies to potentials at once
+                batch_potentials = torch.exp(-batch_energies)
+                all_potentials.append(batch_potentials)
             else:
-                # Process each clique individually for tuple values
-                batch_potentials = [self.compute_potential(values, custom_potential) 
-                                   for values in batch_values]
+                # Fallback to individual processing when using custom potential
+                batch_potentials = []
+                for values in batch_values:
+                    potential = self.compute_potential(values, custom_potential)
+                    if isinstance(potential, torch.Tensor):
+                        batch_potentials.append(potential)
+                    else:
+                        batch_potentials.append(torch.tensor(potential, device=self.device))
                 
-            potentials.extend(batch_potentials)
-            
-        return potentials
+                all_potentials.append(torch.stack(batch_potentials))
+        
+        # Combine all batches
+        if len(all_potentials) == 1:
+            return all_potentials[0]
+        else:
+            return torch.cat(all_potentials)

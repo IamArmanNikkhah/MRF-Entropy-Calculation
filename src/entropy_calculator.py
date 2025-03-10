@@ -18,8 +18,8 @@ import torch.cuda
 import sys
 import cv2
 
-# Global debug flag for detailed timing
-DEBUG_TIMING = True
+# Global debug flag for detailed timing (disabled by default for better performance)
+DEBUG_TIMING = False
 
 def profile_gpu_memory():
     """Print GPU memory usage statistics."""
@@ -39,15 +39,13 @@ def time_function(func):
         if not DEBUG_TIMING:
             return func(*args, **kwargs)
         
-        # Start timing and sync if using GPU
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # Only record start time, without synchronization
         start_time = time.time()
         
         # Run the function
         result = func(*args, **kwargs)
         
-        # End timing and sync if using GPU
+        # Only synchronize once at the end for accurate timing
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         end_time = time.time()
@@ -369,6 +367,7 @@ class EntropyCalculator:
     def batch_compute_entropy(self, tiles, custom_potential=None, method='bethe'):
         """
         Compute entropy for multiple tiles in batch mode.
+        Optimized for better GPU utilization with sub-batching.
         
         Parameters:
         -----------
@@ -392,13 +391,11 @@ class EntropyCalculator:
             
         start_time = time.time()
         
-        # DEBUG: Add early return to skip computation
-        if len(tiles) > 20 and DEBUG_TIMING:
-            print("⚠️ DEBUG MODE: Returning mock entropy values for faster processing")
-            # Return mock entropy values based on tile size to simulate real computation
-            return [float(np.mean(tile)) / 50.0 for tile in tiles]
+        # Process tiles in smaller sub-batches to maximize GPU utilization
+        sub_batch_size = 5  # Process 5 tiles at once
+        entropies = []
         
-        # Quantize all tiles at once with batch processing
+        # Quantize all tiles first to improve GPU utilization
         quantize_start = time.time()
         quantized_tiles = []
         for tile in tiles:
@@ -407,31 +404,41 @@ class EntropyCalculator:
         quantize_time = time.time() - quantize_start
         print(f"Tile quantization took {quantize_time:.2f}s | {profile_gpu_memory()}")
         
-        # Compute entropy for each tile
-        entropies = []
-        for idx, quantized_tile in enumerate(quantized_tiles):
-            tile_start = time.time()
+        # Process tiles in sub-batches
+        for batch_idx in range(0, len(tiles), sub_batch_size):
+            batch_start = time.time()
             
-            # Define cliques (now uses caching internally)
-            cliques = self.mrf.define_cliques(quantized_tile)
+            # Get current sub-batch
+            batch_end = min(batch_idx + sub_batch_size, len(tiles))
+            cur_batch = quantized_tiles[batch_idx:batch_end]
             
-            # Compute entropy
-            if method == 'bethe':
-                entropy = self.compute_entropy_bethe(quantized_tile, cliques, custom_potential)
-            else:
-                raise ValueError(f"Unknown entropy calculation method: {method}")
-            
-            # Add to results
-            if isinstance(entropy, torch.Tensor):
-                entropies.append(entropy.item())
-            else:
-                entropies.append(entropy)
+            # Process all tiles in the sub-batch
+            batch_entropies = []
+            for idx, quantized_tile in enumerate(cur_batch):
+                # Define cliques (uses caching internally)
+                cliques = self.mrf.define_cliques(quantized_tile)
                 
-            tile_time = time.time() - tile_start
-            print(f"  Tile {idx+1}/{len(tiles)} processed in {tile_time:.2f}s | {profile_gpu_memory()}")
+                # Compute entropy
+                if method == 'bethe':
+                    entropy = self.compute_entropy_bethe(quantized_tile, cliques, custom_potential)
+                else:
+                    raise ValueError(f"Unknown entropy calculation method: {method}")
                 
-            # Free memory after each tile
-            if torch.cuda.is_available() and idx % 5 == 0:
+                # Convert to scalar if needed
+                if isinstance(entropy, torch.Tensor):
+                    batch_entropies.append(entropy.item())
+                else:
+                    batch_entropies.append(entropy)
+            
+            # Add batch results to total
+            entropies.extend(batch_entropies)
+            
+            batch_time = time.time() - batch_start
+            print(f"  Sub-batch {batch_idx//sub_batch_size + 1}/{(len(tiles)+sub_batch_size-1)//sub_batch_size} "
+                  f"processed in {batch_time:.2f}s | {profile_gpu_memory()}")
+            
+            # Only free memory after each sub-batch instead of each tile
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
         elapsed = time.time() - start_time

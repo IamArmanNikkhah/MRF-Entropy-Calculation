@@ -32,7 +32,7 @@ from src.mrf_model import QuadwiseMRF
 from src.entropy_calculator import EntropyCalculator
 
 class VideoProcessor:
-    def __init__(self, input_path, output_path, num_tiles=55, use_gpu=True, batch_size=8):
+    def __init__(self, input_path, output_path, num_tiles=55, use_gpu=True, batch_size=8, gpu_memory_fraction=0.7):
         """
         Initialize with video paths and parameters.
         
@@ -48,12 +48,15 @@ class VideoProcessor:
             Whether to use GPU acceleration if available
         batch_size : int
             Number of frames to process in a batch (default: 8)
+        gpu_memory_fraction : float
+            Fraction of GPU memory to use (default: 0.7)
         """
         self.input_path = input_path
         self.output_path = output_path
         self.num_tiles = num_tiles
         self.use_gpu = use_gpu and torch.cuda.is_available()
         self.batch_size = batch_size
+        self.gpu_memory_fraction = gpu_memory_fraction
         
         # Check if input video exists
         if not os.path.exists(input_path):
@@ -72,10 +75,20 @@ class VideoProcessor:
             # Set optimal tensor precision for the GPU
             torch.set_float32_matmul_precision('high')
             
-            # Determine optimal batch size based on available GPU memory
+            # Determine optimal batch size based on available GPU memory with less conservative estimate
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # in GB
-            self.batch_size = min(self.batch_size, max(1, int(gpu_mem / 2)))  # Heuristic: 2GB per frame
-            print(f"Using batch size of {self.batch_size} based on available GPU memory")
+            
+            # Use user-specified GPU memory fraction (default 70%)
+            usable_mem = gpu_mem * self.gpu_memory_fraction
+            
+            # More aggressive memory estimation - assume 0.5GB per frame instead of 2GB
+            memory_per_frame = 0.5  # Conservative estimate was 2GB
+            dynamic_batch_size = max(1, int(usable_mem / memory_per_frame))
+            
+            # Use the minimum of user-specified batch size and our calculated one
+            self.batch_size = min(self.batch_size, dynamic_batch_size) if self.batch_size > 0 else dynamic_batch_size
+            
+            print(f"Using batch size of {self.batch_size} based on {self.gpu_memory_fraction*100:.0f}% of available GPU memory ({usable_mem:.1f}GB)")
         else:
             self.device = torch.device("cpu")
             print("Using CPU for computations")

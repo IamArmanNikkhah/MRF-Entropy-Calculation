@@ -473,11 +473,18 @@ class EntropyCalculator:
         entropies = []
         for tile_tensor in tile_tensors:
             # Calculate gradients
-            gx = tile_tensor[:, 1:] - tile_tensor[:, :-1]
-            gy = tile_tensor[1:, :] - tile_tensor[:-1, :]
+            gx = tile_tensor[:, 1:] - tile_tensor[:, :-1]  # Shape: [height, width-1]
+            gy = tile_tensor[1:, :] - tile_tensor[:-1, :]  # Shape: [height-1, width]
             
-            # Compute gradient magnitude
-            grad_mag = torch.sqrt(gx[:, :-1]**2 + gy[:-1, :]**2 + 1e-10)
+            # Debug shape information if debug flag is on
+            if DEBUG_TIMING:
+                print(f"Tile tensor shape: {tile_tensor.shape}")
+                print(f"gx shape: {gx.shape}, gy shape: {gy.shape}")
+            
+            # Align dimensions - take common region for both gradients
+            # This ensures we're using dimensions that are compatible
+            # The result will be of shape [height-1, width-1]
+            grad_mag = torch.sqrt(gx[:-1, :]**2 + gy[:, :-1]**2 + 1e-10)
             
             # Normalize
             grad_mag = grad_mag / grad_mag.max()

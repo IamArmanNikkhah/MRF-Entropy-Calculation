@@ -9,10 +9,10 @@ models pixel dependencies via quadwise Markov Random Fields, and computes entrop
 Usage:
     python main.py --input <input_video> --output <output_video> [--num-tiles <n>] 
                    [--custom-potential] [--sample-rate <r>] [--no-gpu] [--batch-size <b>]
-                   [--max-frames <m>] [--profile]
+                   [--max-frames <m>] [--profile] [--simplified] [--debug]
 
 Example:
-    python main.py --input 360_video.mp4 --output entropy_video.mp4 --num-tiles 55 --batch-size 8
+    python main.py --input 360_video.mp4 --output entropy_video.mp4 --num-tiles 34 --batch-size 2 --simplified
 """
 
 import os
@@ -28,6 +28,7 @@ import io
 from pstats import SortKey
 
 from src.video_processor import VideoProcessor
+from src.entropy_calculator import DEBUG_TIMING
 import custom_potential
 
 def is_fibonacci_number(n):
@@ -69,22 +70,37 @@ def parse_arguments():
     parser.add_argument("--output", "-o", required=True, help="Path to output video with entropy visualization")
     
     # Optional arguments
-    parser.add_argument("--num-tiles", "-n", type=int, default=55, 
-                        help="Number of tiles to partition the sphere into (ideally a Fibonacci number, default: 55)")
+    parser.add_argument("--num-tiles", "-n", type=int, default=34, 
+                        help="Number of tiles to partition the sphere into (ideally a Fibonacci number, default: 34)")
     parser.add_argument("--custom-potential", "-c", action="store_true", 
                         help="Use custom potential function from custom_potential.py")
     parser.add_argument("--sample-rate", "-s", type=float, default=0.1, 
                         help="Fraction of frames to sample for empirical distribution (default: 0.1)")
     parser.add_argument("--no-gpu", action="store_true", 
                         help="Disable GPU acceleration even if available")
-    parser.add_argument("--batch-size", "-b", type=int, default=8,
-                        help="Number of frames to process in a batch (default: 8)")
+    parser.add_argument("--batch-size", "-b", type=int, default=2,
+                        help="Number of frames to process in a batch (default: 2)")
     parser.add_argument("--max-frames", "-m", type=int, default=None,
                         help="Maximum number of frames to process (default: process all frames)")
     parser.add_argument("--profile", "-p", action="store_true",
                         help="Run the script with cProfile to identify bottlenecks")
+    parser.add_argument("--simplified", "-S", action="store_true",
+                        help="Use simplified entropy calculation (faster but less accurate)")
+    parser.add_argument("--debug", "-d", action="store_true",
+                        help="Enable detailed debug output for performance analysis")
     
     return parser.parse_args()
+
+def setup_debug_flags(debug_enabled):
+    """Set up debug flags in the codebase."""
+    # Import the module
+    import src.entropy_calculator as ec
+    
+    # Set the debug flag
+    ec.DEBUG_TIMING = debug_enabled
+    
+    if debug_enabled:
+        print("Debug mode enabled - detailed timing information will be shown")
 
 def run_with_profiling(args, potential_func):
     """Run the video processing with profiling enabled."""
@@ -103,10 +119,12 @@ def run_with_profiling(args, potential_func):
         batch_size=args.batch_size
     )
     
-    # Run the entropy calculation pipeline
+    # Run the entropy calculation pipeline with simplified mode if requested
     result = processor.run(
         custom_potential=potential_func,
-        sample_rate=args.sample_rate
+        sample_rate=args.sample_rate,
+        use_simplified=args.simplified,
+        max_frames=args.max_frames
     )
     
     # Disable profiling
@@ -126,6 +144,9 @@ def main():
     # Parse command-line arguments
     args = parse_arguments()
     
+    # Set up debug flags if requested
+    setup_debug_flags(args.debug)
+    
     # Check if input file exists
     if not os.path.exists(args.input):
         print(f"Error: Input file '{args.input}' does not exist")
@@ -143,6 +164,10 @@ def main():
     # Print GPU information if available
     if not args.no_gpu and torch.cuda.is_available():
         print_gpu_info()
+
+    # Print processing mode
+    if args.simplified:
+        print("\n⚠️ Using SIMPLIFIED entropy calculation mode (faster but less accurate)")
     
     # Get custom potential function if requested
     potential_func = None
@@ -182,7 +207,9 @@ def main():
         try:
             result = processor.run(
                 custom_potential=potential_func,
-                sample_rate=args.sample_rate
+                sample_rate=args.sample_rate,
+                use_simplified=args.simplified,
+                max_frames=args.max_frames
             )
             
             end_time = time.time()

@@ -8,10 +8,11 @@ models pixel dependencies via quadwise Markov Random Fields, and computes entrop
 
 Usage:
     python main.py --input <input_video> --output <output_video> [--num-tiles <n>] 
-                   [--custom-potential] [--sample-rate <r>] [--no-gpu]
+                   [--custom-potential] [--sample-rate <r>] [--no-gpu] [--batch-size <b>]
+                   [--max-frames <m>] [--profile]
 
 Example:
-    python main.py --input 360_video.mp4 --output entropy_video.mp4 --num-tiles 55
+    python main.py --input 360_video.mp4 --output entropy_video.mp4 --num-tiles 55 --batch-size 8
 """
 
 import os
@@ -19,6 +20,12 @@ import sys
 import argparse
 import importlib.util
 import time
+import torch
+import gc
+import cProfile
+import pstats
+import io
+from pstats import SortKey
 
 from src.video_processor import VideoProcessor
 import custom_potential
@@ -29,6 +36,27 @@ def is_fibonacci_number(n):
     while b < n:
         a, b = b, a + b
     return b == n
+
+def print_gpu_info():
+    """Print detailed information about the available CUDA GPU."""
+    if not torch.cuda.is_available():
+        print("No CUDA GPU available")
+        return
+    
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # in GB
+    current_device = torch.cuda.current_device()
+    device_count = torch.cuda.device_count()
+    
+    print("\n===== GPU Information =====")
+    print(f"GPU: {gpu_name}")
+    print(f"Total memory: {gpu_mem:.2f} GB")
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"PyTorch CUDA: {torch.backends.cudnn.version()}")
+    print(f"Current device: {current_device}")
+    print(f"Device count: {device_count}")
+    print(f"CUDNN enabled: {torch.backends.cudnn.enabled}")
+    print("===========================\n")
 
 def parse_arguments():
     """Parse command-line arguments."""
@@ -49,8 +77,49 @@ def parse_arguments():
                         help="Fraction of frames to sample for empirical distribution (default: 0.1)")
     parser.add_argument("--no-gpu", action="store_true", 
                         help="Disable GPU acceleration even if available")
+    parser.add_argument("--batch-size", "-b", type=int, default=8,
+                        help="Number of frames to process in a batch (default: 8)")
+    parser.add_argument("--max-frames", "-m", type=int, default=None,
+                        help="Maximum number of frames to process (default: process all frames)")
+    parser.add_argument("--profile", "-p", action="store_true",
+                        help="Run the script with cProfile to identify bottlenecks")
     
     return parser.parse_args()
+
+def run_with_profiling(args, potential_func):
+    """Run the video processing with profiling enabled."""
+    print("\nRunning with profiling enabled...\n")
+    
+    # Create a profile object
+    pr = cProfile.Profile()
+    pr.enable()
+    
+    # Initialize video processor
+    processor = VideoProcessor(
+        input_path=args.input,
+        output_path=args.output,
+        num_tiles=args.num_tiles,
+        use_gpu=not args.no_gpu,
+        batch_size=args.batch_size
+    )
+    
+    # Run the entropy calculation pipeline
+    result = processor.run(
+        custom_potential=potential_func,
+        sample_rate=args.sample_rate
+    )
+    
+    # Disable profiling
+    pr.disable()
+    
+    # Print profile results
+    print("\n===== Profiling Results =====")
+    s = io.StringIO()
+    ps = pstats.Stats(pr, stream=s).sort_stats(SortKey.CUMULATIVE)
+    ps.print_stats(20)  # Print top 20 functions by cumulative time
+    print(s.getvalue())
+    
+    return result
 
 def main():
     """Main function to run the entropy calculation pipeline."""
@@ -71,6 +140,10 @@ def main():
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
+    # Print GPU information if available
+    if not args.no_gpu and torch.cuda.is_available():
+        print_gpu_info()
+    
     # Get custom potential function if requested
     potential_func = None
     if args.custom_potential:
@@ -80,36 +153,55 @@ def main():
         else:
             print("Warning: custom_potential.py does not define 'custom_potential'. Using default.")
     
-    # Initialize video processor
-    processor = VideoProcessor(
-        input_path=args.input,
-        output_path=args.output,
-        num_tiles=args.num_tiles,
-        use_gpu=not args.no_gpu
-    )
-    
-    # Run the entropy calculation pipeline
-    print(f"\nProcessing '{args.input}' using {args.num_tiles} tiles...\n")
-    start_time = time.time()
-    
-    try:
-        result = processor.run(
-            custom_potential=potential_func,
-            sample_rate=args.sample_rate
+    # Run with profiling if requested
+    if args.profile:
+        start_time = time.time()
+        try:
+            result = run_with_profiling(args, potential_func)
+            end_time = time.time()
+            duration = end_time - start_time
+        except Exception as e:
+            print(f"Error during profiled processing: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    else:
+        # Initialize video processor
+        processor = VideoProcessor(
+            input_path=args.input,
+            output_path=args.output,
+            num_tiles=args.num_tiles,
+            use_gpu=not args.no_gpu,
+            batch_size=args.batch_size
         )
         
-        end_time = time.time()
-        duration = end_time - start_time
+        # Run the entropy calculation pipeline
+        print(f"\nProcessing '{args.input}' using {args.num_tiles} tiles...\n")
+        start_time = time.time()
         
-        print(f"\nProcessing completed in {duration:.2f} seconds")
-        print(f"Output video saved to: {result['video_path']}")
-        print(f"Entropy values saved to: {result['csv_path']}")
-        
-    except Exception as e:
-        print(f"Error during processing: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        try:
+            result = processor.run(
+                custom_potential=potential_func,
+                sample_rate=args.sample_rate
+            )
+            
+            end_time = time.time()
+            duration = end_time - start_time
+        except Exception as e:
+            print(f"Error during processing: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    
+    # Print summary
+    print(f"\nTotal processing completed in {duration:.2f} seconds")
+    print(f"Output video saved to: {result['video_path']}")
+    print(f"Entropy values saved to: {result['csv_path']}")
+    
+    # Clean up
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()

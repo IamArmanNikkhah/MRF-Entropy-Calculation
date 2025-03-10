@@ -227,7 +227,7 @@ class VideoProcessor:
         
         return result
     
-    def compute_frame_entropy(self, frame, tile_regions, custom_potential=None):
+    def compute_frame_entropy(self, frame, tile_regions, custom_potential=None, use_simplified=True):
         """
         Compute entropy for each tile in a frame.
         Optimized with GPU acceleration.
@@ -240,6 +240,8 @@ class VideoProcessor:
             List of tile region definitions
         custom_potential : function, optional
             Custom smoothness function to replace the default
+        use_simplified : bool
+            Whether to use simplified entropy calculation (much faster but less accurate)
             
         Returns:
         --------
@@ -253,14 +255,17 @@ class VideoProcessor:
             tiles.append(tile)
         
         # Batch compute entropy for all tiles
-        entropies = self.entropy_calculator.batch_compute_entropy(tiles, custom_potential)
+        if use_simplified:
+            entropies = self.entropy_calculator.simplified_batch_compute_entropy(tiles, custom_potential)
+        else:
+            entropies = self.entropy_calculator.batch_compute_entropy(tiles, custom_potential)
         
         # Round to 4 decimal places
         entropies = [round(entropy, 4) for entropy in entropies]
         
         return entropies
     
-    def process_frame_batch(self, frames, tile_regions, custom_potential=None):
+    def process_frame_batch(self, frames, tile_regions, custom_potential=None, use_simplified=True):
         """
         Process a batch of frames in parallel.
         
@@ -283,14 +288,14 @@ class VideoProcessor:
         # Process each frame in the batch
         for i, frame in enumerate(frames):
             # Compute entropy for each tile
-            entropies = self.compute_frame_entropy(frame, tile_regions, custom_potential)
+            entropies = self.compute_frame_entropy(frame, tile_regions, custom_potential, use_simplified)
             
             # Store entropy values
             batch_entropies.append(entropies)
             
         return batch_entropies
     
-    def process_video(self, custom_potential=None, sample_rate=0.1):
+    def process_video(self, custom_potential=None, sample_rate=0.1, use_simplified=True, max_frames=None):
         """
         Process the entire video with batch processing.
         
@@ -310,8 +315,8 @@ class VideoProcessor:
         """
         start_time = time.time()
         
-        # Extract frames
-        frames, fps = self.extract_frames()
+        # Extract frames with max_frames limit if specified
+        frames, fps = self.extract_frames(max_frames=max_frames)
         
         # Sample frames for empirical distribution
         sample_indices = np.random.choice(len(frames), int(len(frames) * sample_rate), replace=False)
@@ -339,8 +344,9 @@ class VideoProcessor:
             end_idx = min((batch_idx + 1) * self.batch_size, len(frames))
             batch_frames = frames[start_idx:end_idx]
             
-            # Process the batch
-            batch_entropies = self.process_frame_batch(batch_frames, tile_regions, custom_potential)
+            # Process the batch with the simplified method if requested
+            batch_entropies = self.process_frame_batch(batch_frames, tile_regions, 
+                                                      custom_potential, use_simplified)
             
             # Add frame numbers to entropy values
             for i, entropies in enumerate(batch_entropies):
@@ -450,7 +456,7 @@ class VideoProcessor:
         print(f"Output video generated at {self.output_path} in {elapsed:.2f} seconds")
         return self.output_path
     
-    def run(self, custom_potential=None, sample_rate=0.1):
+    def run(self, custom_potential=None, sample_rate=0.1, use_simplified=True, max_frames=None):
         """
         Run the entire pipeline with optimized processing.
         
@@ -472,8 +478,13 @@ class VideoProcessor:
             
         total_start_time = time.time()
         
-        # Process video and compute entropy
-        frame_entropies, fps = self.process_video(custom_potential, sample_rate)
+        # Process video and compute entropy with simplified method if requested
+        frame_entropies, fps = self.process_video(
+            custom_potential=custom_potential, 
+            sample_rate=sample_rate,
+            use_simplified=use_simplified,
+            max_frames=max_frames
+        )
         
         # Export entropy values to CSV
         csv_path = self.export_csv(frame_entropies)

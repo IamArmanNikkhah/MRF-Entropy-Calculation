@@ -12,7 +12,7 @@ Usage:
                    [--max-frames <m>] [--profile] [--simplified] [--debug]
 
 Example:
-    python main.py --input 360_video.mp4 --output entropy_video.mp4 --num-tiles 34 --batch-size 2 --simplified
+    python main.py --input 360_video.mp4 --output entropy_video.mp4 --num-tiles 34 --batch-size 16 --gpu-memory-fraction 0.7 --simplified
 """
 
 import os
@@ -78,8 +78,10 @@ def parse_arguments():
                         help="Fraction of frames to sample for empirical distribution (default: 0.1)")
     parser.add_argument("--no-gpu", action="store_true", 
                         help="Disable GPU acceleration even if available")
-    parser.add_argument("--batch-size", "-b", type=int, default=2,
-                        help="Number of frames to process in a batch (default: 2)")
+    parser.add_argument("--batch-size", "-b", type=int, default=8,
+                        help="Number of frames to process in a batch (default: 8)")
+    parser.add_argument("--gpu-memory-fraction", "-g", type=float, default=0.7,
+                        help="Fraction of GPU memory to use (0.0-1.0, default: 0.7)")
     parser.add_argument("--max-frames", "-m", type=int, default=None,
                         help="Maximum number of frames to process (default: process all frames)")
     parser.add_argument("--profile", "-p", action="store_true",
@@ -116,7 +118,8 @@ def run_with_profiling(args, potential_func):
         output_path=args.output,
         num_tiles=args.num_tiles,
         use_gpu=not args.no_gpu,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        gpu_memory_fraction=args.gpu_memory_fraction
     )
     
     # Run the entropy calculation pipeline with simplified mode if requested
@@ -197,7 +200,8 @@ def main():
             output_path=args.output,
             num_tiles=args.num_tiles,
             use_gpu=not args.no_gpu,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            gpu_memory_fraction=args.gpu_memory_fraction
         )
         
         # Run the entropy calculation pipeline

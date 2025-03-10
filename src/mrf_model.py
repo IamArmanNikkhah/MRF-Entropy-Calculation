@@ -97,6 +97,9 @@ class QuadwiseMRF:
         # This maps [0-50] to 0, [51-101] to 1, etc.
         quantized = np.floor(frame / 51).astype(np.uint8)
         
+        # Ensure values are in range [0-4] by clipping any value of 5 to 4
+        quantized = np.clip(quantized, 0, 4)
+        
         return quantized
     
     def estimate_empirical_distribution(self, frames, sample_rate=0.1):
@@ -170,8 +173,8 @@ class QuadwiseMRF:
             (x_j, x_k), (x_j, x_l), (x_k, x_l)
         ]
         
-        # Sum squared differences for all pairs
-        smoothness = sum((a - b) ** 2 for a, b in pairs)
+        # Sum squared differences for all pairs using float to prevent overflow
+        smoothness = sum((float(a) - float(b)) ** 2 for a, b in pairs)
         return smoothness
     
     def compute_energy(self, clique_values, custom_potential=None):
